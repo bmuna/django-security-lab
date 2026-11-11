@@ -7,7 +7,19 @@ from datetime import datetime, timezone
 from django_redis import get_redis_connection
 from flask import request
 from rest_framework.throttling import AnonRateThrottle, BaseThrottle
+from rest_framework.exceptions import APIException
+from redis.exceptions import (
+    ConnectionError as RedisConnectionError,
+    TimeoutError as RedisTimeoutError,
+)
+from django_redis.exceptions import ConnectionInterrupted
 
+
+class RedisUnavailable(APIException):
+    status_code = 503
+    default_detail = "Authentication service temporarily unavailable."
+    default_code = "redis_unavailable"
+    
 
 class LoginRateThrottle(AnonRateThrottle):
     scope = 'login'
@@ -22,7 +34,17 @@ class LoginRateThrottle(AnonRateThrottle):
     
 
     def allow_request(self, request, view):
-        allowed = super().allow_request(request, view)
+        try:
+            allowed = super().allow_request(request, view)
+
+        except (
+            RedisConnectionError,
+            RedisTimeoutError,
+            ConnectionInterrupted,
+        ):
+            raise RedisUnavailable()
+        
+        # allowed = super().allow_request(request, view)
         print("IP THROTTLE:", allowed, self.history, self.num_requests)
 
         self.request_count = len(self.history)
@@ -76,28 +98,31 @@ def record_rate_limit_event(
     decision,
     client_ip=None,
 ):
-    redis_client = get_redis_connection('default')
+    try:
+        redis_client = get_redis_connection('default')
 
-    event = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "limiter": limiter,
-        "request_count": int(request_count),
-        "limit": limit,
-        "window_seconds": window,
-        "decision": decision,
-        "client_ip": client_ip,
-    }
+        event = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "limiter": limiter,
+            "request_count": int(request_count),
+            "limit": limit,
+            "window_seconds": window,
+            "decision": decision,
+            "client_ip": client_ip,
+        }
 
-    key = "security:diagnostics:login"
+        key = "security:diagnostics:login"
 
-    pipeline = redis_client.pipeline()
+        pipeline = redis_client.pipeline()
 
-    pipeline.lpush(key, json.dumps(event))
-    pipeline.ltrim(key, 0, 9999)
-    pipeline.expire(key, 86400)
+        pipeline.lpush(key, json.dumps(event))
+        pipeline.ltrim(key, 0, 9999)
+        pipeline.expire(key, 86400)
 
-    pipeline.execute()
-    
+        pipeline.execute()
+
+    except (ConnectionError, TimeoutError):
+        pass
     
 
 

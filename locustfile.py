@@ -31,26 +31,49 @@ import random
 
 
 
-class LoginUser(HttpUser):
-    wait_time = between(0, 0)
+# class LoginUser(HttpUser):
+#     wait_time = between(0, 0)
 
-    ip_addresses = [
-        "192.168.1.10",
-        "192.168.1.20",
-        "192.168.1.30",
-    ]
+#     ip_addresses = [
+#         "192.168.1.10",
+#         "192.168.1.20",
+#         "192.168.1.30",
+#     ]
+
+#     @task
+#     def login(self):
+#         simulated_ip = random.choice(self.ip_addresses)
+
+#         self.client.post(
+#             "/api/login/",
+#             headers={
+#                 "X-Test-Client-IP": simulated_ip,
+#             },
+#             json={
+#                 "username": "distributed_test_user",
+#                 "password": "WrongPassword123!"
+#             }
+#         )
+
+
+
+
+
+class LoginUser(HttpUser):
+    host = "http://127.0.0.1"
+    wait_time = between(0, 0)
 
     @task
     def login(self):
-        simulated_ip = random.choice(self.ip_addresses)
+        port = random.choice([8000, 8001])
+
+        simulated_ip = f"192.168.100.{random.randint(1, 200)}"
 
         self.client.post(
-            "/api/login/",
-            headers={
-                "X-Test-Client-IP": simulated_ip,
-            },
+            f"{self.host}:{port}/api/login/",
+            headers={"X-Test-Client-IP": simulated_ip},
             json={
-                "username": "distributed_test_user",
+                "username": "concurrent_test_user",
                 "password": "WrongPassword123!"
             }
         )
