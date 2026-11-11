@@ -1,12 +1,42 @@
 import hashlib
+from urllib import request
 import uuid
+import json
+from datetime import datetime, timezone
 
 from django_redis import get_redis_connection
+from flask import request
 from rest_framework.throttling import AnonRateThrottle, BaseThrottle
 
 
 class LoginRateThrottle(AnonRateThrottle):
     scope = 'login'
+    
+    def get_ident(self, request):
+        test_ip = request.headers.get('X-Test-Client-IP')
+
+        if test_ip:
+            return test_ip
+
+        return super().get_ident(request)
+    
+
+    def allow_request(self, request, view):
+        allowed = super().allow_request(request, view)
+        print("IP THROTTLE:", allowed, self.history, self.num_requests)
+
+        self.request_count = len(self.history)
+
+        record_rate_limit_event(
+            limiter="ip",
+            request_count=self.request_count,
+            limit=self.num_requests,
+            window=self.duration,
+            decision="allowed" if allowed else "rejected",
+            client_ip=self.get_ident(request),
+        )
+
+        return allowed
 
 ACCOUNT_RISK_THRESHOLDS = {
     "medium": 5,
@@ -34,6 +64,45 @@ TOKEN_BUCKET_REFILL_RATE = 1
 TOKEN_BUCKET_REFILL_INTERVAL = 10
 
 
+LEAKY_BUCKET_CAPACITY = 5
+LEAKY_BUCKET_INTERVAL = 2
+
+
+def record_rate_limit_event(
+    limiter,
+    request_count,
+    limit,
+    window,
+    decision,
+    client_ip=None,
+):
+    redis_client = get_redis_connection('default')
+
+    event = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "limiter": limiter,
+        "request_count": int(request_count),
+        "limit": limit,
+        "window_seconds": window,
+        "decision": decision,
+        "client_ip": client_ip,
+    }
+
+    key = "security:diagnostics:login"
+
+    pipeline = redis_client.pipeline()
+
+    pipeline.lpush(key, json.dumps(event))
+    pipeline.ltrim(key, 0, 9999)
+    pipeline.expire(key, 86400)
+
+    pipeline.execute()
+    
+    
+
+
+
+
 class GlobalLoginRateThrottle(BaseThrottle):
     GLOBAL_LOGIN_RATE_LIMIT_SCRIPT = """
     local current_count = redis.call('INCR', KEYS[1])
@@ -53,11 +122,6 @@ class GlobalLoginRateThrottle(BaseThrottle):
     def allow_request(self, request, view):
         redis_client = get_redis_connection('default')
 
-        # current_count = redis_client.incr(self.key)
-
-        # if current_count == 1:
-        #     redis_client.expire(self.key, self.window)
-        
         current_count = redis_client.eval(
             self.GLOBAL_LOGIN_RATE_LIMIT_SCRIPT,
             1,
@@ -65,8 +129,19 @@ class GlobalLoginRateThrottle(BaseThrottle):
             self.window
         )
 
-        return current_count <= self.limit
+        allowed = current_count <= self.limit
 
+        record_rate_limit_event(
+            limiter="global",
+            request_count=current_count,
+            limit=self.limit,
+            window=self.window,
+            decision="allowed" if allowed else "rejected",
+            client_ip=self.get_ident(request),
+        )
+
+        return allowed
+    
     def wait(self):
         redis_client = get_redis_connection('default')
         remaining_time = redis_client.ttl(self.key)
@@ -355,3 +430,123 @@ class LoginTokenBucketThrottle(BaseThrottle):
 
     def wait(self):
         return 10
+    
+    
+    
+    
+LEAKY_BUCKET_SCRIPT = """
+local key = KEYS[1]
+
+local capacity = tonumber(ARGV[1])
+local interval = tonumber(ARGV[2]) * 1000
+local request_id = ARGV[3]
+
+-- Get current Redis time in milliseconds
+local time = redis.call('TIME')
+local now = (tonumber(time[1]) * 1000)
+    + math.floor(tonumber(time[2]) / 1000)
+
+-- Check how many requests are waiting
+local queue_size = redis.call('ZCARD', key)
+
+-- Reject if the queue is full
+if queue_size >= capacity then
+    return {0, 0, queue_size}
+end
+
+-- Find the last scheduled request
+local last = redis.call(
+    'ZREVRANGE',
+    key,
+    0,
+    0,
+    'WITHSCORES'
+)
+
+local scheduled_at = now
+
+if #last > 0 then
+    local last_scheduled = tonumber(last[2])
+
+    scheduled_at = math.max(now, last_scheduled) + interval
+end
+
+-- Add the request to the queue
+redis.call(
+    'ZADD',
+    key,
+    scheduled_at,
+    request_id
+)
+
+return {1, scheduled_at, queue_size + 1}
+"""
+
+
+
+GET_NEXT_LEAKY_REQUEST_SCRIPT = """
+local key = KEYS[1]
+
+-- Get current Redis time in milliseconds
+local time = redis.call('TIME')
+local now = (tonumber(time[1]) * 1000)
+    + math.floor(tonumber(time[2]) / 1000)
+
+-- Find the earliest request whose scheduled time has arrived
+local request = redis.call(
+    'ZRANGEBYSCORE',
+    key,
+    '-inf',
+    now,
+    'LIMIT',
+    0,
+    1
+)
+
+if #request == 0 then
+    return nil
+end
+
+-- Remove the request from the queue
+redis.call('ZREM', key, request[1])
+
+return request[1]
+"""
+
+
+
+def add_leaky_bucket_request(key):
+    redis_client = get_redis_connection('default')
+
+    request_id = uuid.uuid4().hex
+
+    result = redis_client.eval(
+        LEAKY_BUCKET_SCRIPT,
+        1,
+        key,
+        LEAKY_BUCKET_CAPACITY,
+        LEAKY_BUCKET_INTERVAL,
+        request_id
+    )
+
+    accepted, scheduled_at, queue_size = result
+
+    return {
+        "accepted": bool(accepted),
+        "scheduled_at": scheduled_at,
+        "queue_size": queue_size,
+    }
+    
+def get_next_leaky_request(key):
+    redis_client = get_redis_connection('default')
+
+    result = redis_client.eval(
+        GET_NEXT_LEAKY_REQUEST_SCRIPT,
+        1,
+        key
+    )
+
+    if result is None:
+        return None
+
+    return result.decode('utf-8')

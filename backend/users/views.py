@@ -25,17 +25,14 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework_simplejwt.exceptions import TokenError
 
 from .models import RevokedAccessToken, UserMFA
-from rest_framework.throttling import AnonRateThrottle
 from .throttles import LoginRateThrottle, GlobalLoginRateThrottle, get_account_risk_level, is_mfa_rate_limited, record_mfa_failure
 from .throttles import record_failed_login,reset_failed_login,get_account_risk_level
 from django_redis import get_redis_connection
 
 
-class LoginRateThrottle(AnonRateThrottle):
-    scope = 'login'
 
 class CustomTokenObtainPairView(TokenObtainPairView):
-    throttle_classes = [LoginRateThrottle,GlobalLoginRateThrottle]
+    throttle_classes = [LoginRateThrottle, GlobalLoginRateThrottle]
     
     
 CONSUME_MFA_CHALLENGE_SCRIPT = """
