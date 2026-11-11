@@ -1,16 +1,56 @@
 
 from locust import HttpUser, task, between
+import random
+
+
+# class LoginUser(HttpUser):
+#     wait_time = between(0, 0)
+
+#     ip_addresses = [
+#         "192.168.1.10",
+#         "192.168.1.20",
+#         "192.168.1.30",
+#     ]
+
+#     @task
+#     def login(self):
+#         simulated_ip = random.choice(self.ip_addresses)
+
+#         self.client.post(
+#             "/api/login/",
+#             headers={
+#                 # "X-Test-Client-IP": simulated_ip,
+#                 "X-Test-Client-IP": "192.168.1.99",
+#             },
+#             json={
+#                 "username": "ip_throttle_test_user",
+#                 "password": "WrongPassword123!"
+#             }
+#         )
+
+
 
 
 class LoginUser(HttpUser):
     wait_time = between(0, 0)
 
+    ip_addresses = [
+        "192.168.1.10",
+        "192.168.1.20",
+        "192.168.1.30",
+    ]
+
     @task
     def login(self):
+        simulated_ip = random.choice(self.ip_addresses)
+
         self.client.post(
             "/api/login/",
+            headers={
+                "X-Test-Client-IP": simulated_ip,
+            },
             json={
-                "username": "load_test_user",
+                "username": "distributed_test_user",
                 "password": "WrongPassword123!"
             }
         )
