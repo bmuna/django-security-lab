@@ -1,6 +1,7 @@
 
+import random as random_module
 from locust import HttpUser, task, between
-import random
+# import random
 
 
 # class LoginUser(HttpUser):
@@ -59,18 +60,21 @@ import random
 
 
 
+
+
+
 class LoginUser(HttpUser):
     host = "http://127.0.0.1"
     wait_time = between(0, 0)
 
     @task
     def login(self):
-        port = random.choice([8000, 8001])
+        port = random_module.choice([8000, 8001])
 
-        simulated_ip = f"192.168.100.{random.randint(1, 200)}"
+        simulated_ip = "192.168.250.10"
 
         self.client.post(
-            f"{self.host}:{port}/api/login/",
+            f"http://127.0.0.1:{port}/api/login/",
             headers={"X-Test-Client-IP": simulated_ip},
             json={
                 "username": "concurrent_test_user",

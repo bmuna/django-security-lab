@@ -1,4 +1,6 @@
 import hashlib
+import time
+
 from urllib import request
 import uuid
 import json
@@ -20,10 +22,50 @@ class RedisUnavailable(APIException):
     default_detail = "Authentication service temporarily unavailable."
     default_code = "redis_unavailable"
     
+    
 
 class LoginRateThrottle(AnonRateThrottle):
     scope = 'login'
-    
+
+    IP_RATE_LIMIT_SCRIPT = """
+    local now = tonumber(ARGV[1])
+    local window = tonumber(ARGV[2])
+    local limit = tonumber(ARGV[3])
+    local member = ARGV[4]
+
+    -- Remove requests outside the sliding window.
+    redis.call(
+        'ZREMRANGEBYSCORE',
+        KEYS[1],
+        '-inf',
+        now - window
+    )
+
+    -- Count requests still inside the window.
+    local count = redis.call('ZCARD', KEYS[1])
+
+    -- Reject if the limit has already been reached.
+    if count >= limit then
+        local oldest = redis.call(
+            'ZRANGE',
+            KEYS[1],
+            0,
+            0,
+            'WITHSCORES'
+        )
+
+        local retry_after = tonumber(oldest[2]) + window - now
+
+        return {0, retry_after, count}
+    end
+
+    -- Record this request.
+    redis.call('ZADD', KEYS[1], now, member)
+    redis.call('EXPIRE', KEYS[1], window)
+
+    return {1, 0, count + 1}
+    """
+
     def get_ident(self, request):
         test_ip = request.headers.get('X-Test-Client-IP')
 
@@ -31,11 +73,29 @@ class LoginRateThrottle(AnonRateThrottle):
             return test_ip
 
         return super().get_ident(request)
-    
 
     def allow_request(self, request, view):
+        client_ip = self.get_ident(request)
+
+        # Hash the IP to create a safe Redis key.
+        ip_hash = hashlib.sha256(
+            client_ip.encode()
+        ).hexdigest()
+
+        redis_key = f"security:throttle:{self.scope}:{ip_hash}"
+
         try:
-            allowed = super().allow_request(request, view)
+            redis_client = get_redis_connection('default')
+
+            result = redis_client.eval(
+                self.IP_RATE_LIMIT_SCRIPT,
+                1,
+                redis_key,
+                time.time(),
+                self.duration,
+                self.num_requests,
+                uuid.uuid4().hex,
+            )
 
         except (
             RedisConnectionError,
@@ -43,11 +103,10 @@ class LoginRateThrottle(AnonRateThrottle):
             ConnectionInterrupted,
         ):
             raise RedisUnavailable()
-        
-        # allowed = super().allow_request(request, view)
-        print("IP THROTTLE:", allowed, self.history, self.num_requests)
 
-        self.request_count = len(self.history)
+        allowed = bool(result[0])
+        self.wait_seconds = float(result[1]) if not allowed else None
+        self.request_count = int(result[2])
 
         record_rate_limit_event(
             limiter="ip",
@@ -55,10 +114,53 @@ class LoginRateThrottle(AnonRateThrottle):
             limit=self.num_requests,
             window=self.duration,
             decision="allowed" if allowed else "rejected",
-            client_ip=self.get_ident(request),
+            client_ip=client_ip,
         )
 
         return allowed
+
+    def wait(self):
+        return self.wait_seconds
+
+
+# class LoginRateThrottle(AnonRateThrottle):
+#     scope = 'login'
+    
+#     def get_ident(self, request):
+#         test_ip = request.headers.get('X-Test-Client-IP')
+
+#         if test_ip:
+#             return test_ip
+
+#         return super().get_ident(request)
+    
+
+#     def allow_request(self, request, view):
+#         try:
+#             allowed = super().allow_request(request, view)
+
+#         except (
+#             RedisConnectionError,
+#             RedisTimeoutError,
+#             ConnectionInterrupted,
+#         ):
+#             raise RedisUnavailable()
+        
+#         # allowed = super().allow_request(request, view)
+#         print("IP THROTTLE:", allowed, self.history, self.num_requests)
+
+#         self.request_count = len(self.history)
+
+#         record_rate_limit_event(
+#             limiter="ip",
+#             request_count=self.request_count,
+#             limit=self.num_requests,
+#             window=self.duration,
+#             decision="allowed" if allowed else "rejected",
+#             client_ip=self.get_ident(request),
+#         )
+
+#         return allowed
 
 ACCOUNT_RISK_THRESHOLDS = {
     "medium": 5,
@@ -126,8 +228,6 @@ def record_rate_limit_event(
     
 
 
-
-
 class GlobalLoginRateThrottle(BaseThrottle):
     GLOBAL_LOGIN_RATE_LIMIT_SCRIPT = """
     local current_count = redis.call('INCR', KEYS[1])
@@ -145,14 +245,22 @@ class GlobalLoginRateThrottle(BaseThrottle):
     key = 'security:login:global'
 
     def allow_request(self, request, view):
-        redis_client = get_redis_connection('default')
+        try:
+            redis_client = get_redis_connection('default')
 
-        current_count = redis_client.eval(
-            self.GLOBAL_LOGIN_RATE_LIMIT_SCRIPT,
-            1,
-            self.key,
-            self.window
-        )
+            current_count = redis_client.eval(
+                self.GLOBAL_LOGIN_RATE_LIMIT_SCRIPT,
+                1,
+                self.key,
+                self.window
+            )
+
+        except (
+            RedisConnectionError,
+            RedisTimeoutError,
+            ConnectionInterrupted,
+        ):
+            raise RedisUnavailable()
 
         allowed = current_count <= self.limit
 
@@ -167,11 +275,21 @@ class GlobalLoginRateThrottle(BaseThrottle):
 
         return allowed
     
+
     def wait(self):
-        redis_client = get_redis_connection('default')
-        remaining_time = redis_client.ttl(self.key)
+        try:
+            redis_client = get_redis_connection('default')
+            remaining_time = redis_client.ttl(self.key)
+
+        except (
+            RedisConnectionError,
+            RedisTimeoutError,
+            ConnectionInterrupted,
+        ):
+            raise RedisUnavailable()
 
         return remaining_time if remaining_time > 0 else self.window
+
     
 
    
